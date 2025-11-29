@@ -118,11 +118,15 @@ app.get("/api/token-info", async (req, res) => {
 
 // ---------- DEX METRICS (DexScreener) ----------
 type DexToken = {
+  address?: string;
   symbol?: string;
+  name?: string;
 };
 
 type DexLiquidity = {
   usd?: number;
+  base?: number;
+  quote?: number;
 };
 
 type DexVolume = {
@@ -181,6 +185,163 @@ app.get("/api/cbs-metrics", async (req, res) => {
     console.error("cbs-metrics error:", e);
     return res.status(500).json({
       error: "Failed to fetch metrics from DexScreener",
+      message: e?.message || String(e)
+    });
+  }
+});
+
+// ---------- TOKEN SAFETY CHECK ----------
+app.get("/api/token-safety-check", async (req, res) => {
+  const mintDefault = "B9z8cEWFmc7LvQtjKsaLoKqW5MJmGRCWqs1DPKupCfkk"; // CBS
+  const mintStr = ((req.query.mint as string | undefined) || mintDefault).trim();
+
+  let mint: PublicKey;
+  try {
+    mint = new PublicKey(mintStr);
+  } catch {
+    return res.status(400).json({ error: "Invalid mint address" });
+  }
+
+  try {
+    // 1) On-chain mint info
+    const info = await connection.getParsedAccountInfo(mint, "confirmed");
+    if (!info.value) {
+      return res.status(404).json({ error: "Mint account not found" });
+    }
+
+    const data = info.value.data as ParsedAccountData;
+    if (data.program !== "spl-token" || data.parsed.type !== "mint") {
+      return res.status(400).json({
+        error: "Account is not a SPL mint",
+        program: data.program,
+        type: data.parsed.type
+      });
+    }
+
+    const parsed = data.parsed.info as any;
+    const decimals: number = parsed.decimals;
+    const supplyRaw: string = parsed.supply;
+    const supplyBig = BigInt(supplyRaw);
+    const divisor = BigInt(10) ** BigInt(decimals);
+    const uiSupply = Number(supplyBig) / Number(divisor);
+
+    const mintAuthority = parsed.mintAuthority ?? null;
+    const freezeAuthority = parsed.freezeAuthority ?? null;
+    const isInitialized = parsed.isInitialized ?? null;
+
+    // 2) DexScreener pools
+    const dsUrl = `https://api.dexscreener.com/latest/dex/tokens/${mintStr}`;
+    const r = await fetch(dsUrl as any);
+    let pools: DexPair[] = [];
+    if (r.ok) {
+      const { pairs } = (await r.json()) as { pairs?: DexPair[] };
+      pools = pairs ?? [];
+    }
+
+    const raydium = pools.filter((p) =>
+      (p.dexId || "").toLowerCase().includes("raydium")
+    );
+    const totalLiquidityUsd = pools.reduce(
+      (acc, p) => acc + (p.liquidity?.usd || 0),
+      0
+    );
+    const largestPool = pools.reduce<DexPair | null>((best, p) => {
+      const cur = p.liquidity?.usd || 0;
+      const bestVal = best?.liquidity?.usd || 0;
+      return cur > bestVal ? p : best;
+    }, null);
+
+    // 3) Heuristics
+    const immutableMint = mintAuthority === null;
+    const canFreeze = freezeAuthority !== null;
+    const hasRaydiumPool = raydium.length > 0;
+    const lowLiquidity = totalLiquidityUsd < 1000; // arbitrair
+    const veryLowLiquidity = totalLiquidityUsd < 100;
+
+    const reasons: string[] = [];
+
+    if (immutableMint) {
+      reasons.push("Mint authority revoked (immutable supply).");
+    } else {
+      reasons.push("Mint authority is still active (supply can change).");
+    }
+
+    if (canFreeze) {
+      reasons.push("Freeze authority is set (accounts can be frozen).");
+    } else {
+      reasons.push("Freeze authority revoked (no freeze control).");
+    }
+
+    if (hasRaydiumPool) {
+      reasons.push(
+        `Raydium pools found (${raydium.length}), total liquidity ≈ $${totalLiquidityUsd.toFixed(
+          2
+        )}.`
+      );
+    } else {
+      reasons.push("No Raydium pools found on DexScreener.");
+    }
+
+    if (veryLowLiquidity) {
+      reasons.push(
+        "Very low liquidity (< $100), price can be extremely volatile and easy to manipulate."
+      );
+    } else if (lowLiquidity) {
+      reasons.push(
+        "Low liquidity (< $1000), price impact for trades can be high."
+      );
+    }
+
+    // Simple risk label
+    let riskLevel: "low" | "medium" | "high" = "medium";
+
+    if (immutableMint && !canFreeze && hasRaydiumPool && !veryLowLiquidity) {
+      riskLevel = "low";
+    } else if (!immutableMint || canFreeze || veryLowLiquidity) {
+      riskLevel = "high";
+    } else {
+      riskLevel = "medium";
+    }
+
+    return res.json({
+      mint: mintStr,
+      rpcUrl: RPC_URL,
+      onChain: {
+        decimals,
+        supplyRaw,
+        supply: uiSupply,
+        mintAuthority,
+        freezeAuthority,
+        isInitialized
+      },
+      dex: {
+        totalPools: pools.length,
+        totalLiquidityUsd,
+        largestPool: largestPool
+          ? {
+              dexId: largestPool.dexId,
+              pairAddress: largestPool.pairAddress,
+              liquidityUsd: largestPool.liquidity?.usd || 0,
+              url: largestPool.url
+            }
+          : null
+      },
+      safety: {
+        immutableMint,
+        canFreeze,
+        hasRaydiumPool,
+        lowLiquidity,
+        veryLowLiquidity,
+        riskLevel,
+        reasons
+      },
+      disclaimer:
+        "This is a heuristic safety check based on on-chain metadata and DexScreener data. It is NOT financial advice. Always do your own research."
+    });
+  } catch (e: any) {
+    console.error("token-safety-check error:", e);
+    return res.status(500).json({
+      error: "Failed to run token safety check",
       message: e?.message || String(e)
     });
   }
