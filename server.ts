@@ -445,6 +445,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 
 // -----------------------------------------------------------------------------
 // /api/holder-info  -> top holders + concentratie
+//  (NU MET getParsedProgramAccounts ipv getParsedTokenAccountsByMint)
 // -----------------------------------------------------------------------------
 
 app.get("/api/holder-info", async (req: Request, res: Response) => {
@@ -495,10 +496,23 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    // Alle token accounts voor deze mint
-    const tokenAccounts = await connection.getParsedTokenAccountsByMint(
-      mintKey,
-      "confirmed"
+    // Alle token accounts voor deze mint via getParsedProgramAccounts
+    const tokenAccounts = await connection.getParsedProgramAccounts(
+      TOKEN_PROGRAM_ID,
+      {
+        commitment: "confirmed",
+        filters: [
+          // SPL-token account size
+          { dataSize: 165 },
+          // filter op mint (offset 0 in raw layout)
+          {
+            memcmp: {
+              offset: 0,
+              bytes: mintKey.toBase58(),
+            },
+          },
+        ],
+      }
     );
 
     type HolderAgg = {
@@ -508,7 +522,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
 
     const holdersMap = new Map<string, HolderAgg>();
 
-    for (const ta of tokenAccounts.value) {
+    for (const ta of tokenAccounts) {
       const info = ta.account.data as ParsedAccountData;
       if (info.program !== "spl-token" || info.parsed.type !== "account") {
         continue;
