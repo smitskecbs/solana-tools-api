@@ -15,9 +15,7 @@ import fetch from "node-fetch";
 // Basic setup
 // -----------------------------------------------------------------------------
 
-const RPC_URL =
-  process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
-
+const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const PORT = Number(process.env.PORT || 3000);
 
 const connection = new Connection(RPC_URL, "confirmed");
@@ -28,6 +26,14 @@ const TOKEN_PROGRAM_ID = new PublicKey(
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+function isScanAbortedError(e: any): boolean {
+  const msg = (e?.message || "").toString().toLowerCase();
+  return (
+    msg.includes("scan aborted") ||
+    msg.includes("accumulated scan results exceeded the limit")
+  );
+}
 
 // Simple root
 app.get("/", (_req: Request, res: Response) => {
@@ -95,11 +101,9 @@ app.get("/api/wallet-info", async (req: Request, res: Response) => {
   }
 
   try {
-    // 1) SOL balance
     const lamports = await connection.getBalance(pubkey, "confirmed");
     const sol = lamports / LAMPORTS_PER_SOL;
 
-    // 2) SPL tokens (alle niet-nul balances)
     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
       pubkey,
       { programId: TOKEN_PROGRAM_ID },
@@ -307,7 +311,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
   }
 
   try {
-    // On-chain mint data
     const parsed = await connection.getParsedAccountInfo(mintKey, "confirmed");
     if (!parsed.value) {
       return res.status(404).json({
@@ -335,7 +338,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
     const freezeAuthority = info.freezeAuthority ?? null;
     const isInitialized = !!info.isInitialized;
 
-    // Dex data
     const pairs = await fetchDexPairsForMint(mint);
     const raydiumPairs = pairs.filter(
       (p) => p.chainId === "solana" && p.dexId.toLowerCase() === "raydium"
@@ -353,7 +355,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
       null
     );
 
-    // Heuristieken
     const reasons: string[] = [];
     const immutableMint = mintAuthority === null;
     const canFreeze = freezeAuthority !== null;
@@ -445,67 +446,28 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/holder-info  -> top holders + concentratie
-//  (NU MET getParsedProgramAccounts ipv getParsedTokenAccountsByMint)
+// Helper: aggregate holders by owner (full scan + fallback top accounts)
 // -----------------------------------------------------------------------------
 
-app.get("/api/holder-info", async (req: Request, res: Response) => {
-  const mint = (req.query.mint as string | undefined)?.trim();
-  const minStr = (req.query.min as string | undefined)?.trim();
-  const limitStr = (req.query.limit as string | undefined)?.trim();
+type HolderAgg = {
+  owner: string;
+  uiAmount: number;
+};
 
-  if (!mint) {
-    return res.status(400).json({ error: "Missing mint query param" });
-  }
-
-  let mintKey: PublicKey;
+async function aggregateHoldersForMint(
+  mintKey: PublicKey
+): Promise<{
+  holders: HolderAgg[];
+  usedFallback: boolean;
+}> {
+  // 1) probeer volledige scan
   try {
-    mintKey = new PublicKey(mint);
-  } catch {
-    return res.status(400).json({ error: "Invalid mint address" });
-  }
-
-  const minAmount = minStr ? parseFloat(minStr) : 0;
-  const limit = limitStr ? parseInt(limitStr, 10) : 100;
-
-  try {
-    // Mint info (decimals + supply)
-    const parsedMint = await connection.getParsedAccountInfo(
-      mintKey,
-      "confirmed"
-    );
-    if (!parsedMint.value) {
-      return res.status(404).json({
-        error: "Mint account not found",
-        mint,
-      });
-    }
-
-    const mintData = parsedMint.value.data as ParsedAccountData;
-    if (mintData.program !== "spl-token" || mintData.parsed.type !== "mint") {
-      return res.status(400).json({
-        error: "Account is not an SPL mint",
-        mint,
-      });
-    }
-
-    const mInfo: any = mintData.parsed.info;
-    const decimals: number = mInfo.decimals;
-    const supplyRaw: string = mInfo.supply;
-    const supply =
-      decimals >= 0
-        ? Number(supplyRaw) / Math.pow(10, decimals)
-        : Number(supplyRaw);
-
-    // Alle token accounts voor deze mint via getParsedProgramAccounts
     const tokenAccounts = await connection.getParsedProgramAccounts(
       TOKEN_PROGRAM_ID,
       {
         commitment: "confirmed",
         filters: [
-          // SPL-token account size
           { dataSize: 165 },
-          // filter op mint (offset 0 in raw layout)
           {
             memcmp: {
               offset: 0,
@@ -515,11 +477,6 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
         ],
       }
     );
-
-    type HolderAgg = {
-      owner: string;
-      uiAmount: number;
-    };
 
     const holdersMap = new Map<string, HolderAgg>();
 
@@ -553,20 +510,119 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       }
     }
 
-    // Naar array, sorteren
-    let holders = Array.from(holdersMap.values());
-    holders.sort((a, b) => b.uiAmount - a.uiAmount);
+    const holders = Array.from(holdersMap.values()).sort(
+      (a, b) => b.uiAmount - a.uiAmount
+    );
 
+    return { holders, usedFallback: false };
+  } catch (e: any) {
+    if (!isScanAbortedError(e)) {
+      throw e;
+    }
+
+    // 2) fallback: top token accounts via getTokenLargestAccounts
+    const largest = await connection.getTokenLargestAccounts(mintKey, "confirmed");
+    const values = largest.value || [];
+
+    if (!values.length) {
+      return { holders: [], usedFallback: true };
+    }
+
+    const accountPubkeys = values.map((v) => v.address);
+    const parsedInfos = await Promise.all(
+      accountPubkeys.map((pk) => connection.getParsedAccountInfo(pk, "confirmed"))
+    );
+
+    const holdersMap = new Map<string, HolderAgg>();
+
+    values.forEach((v, idx) => {
+      const infoWrapper = parsedInfos[idx];
+      const uiAmount = v.uiAmount || 0;
+      if (!uiAmount || uiAmount === 0) return;
+
+      const parsedData = infoWrapper.value?.data as ParsedAccountData | undefined;
+      if (!parsedData || parsedData.program !== "spl-token") return;
+      const parsed: any = parsedData.parsed.info;
+      const owner: string = parsed.owner;
+
+      const prev = holdersMap.get(owner);
+      if (prev) {
+        prev.uiAmount += uiAmount;
+      } else {
+        holdersMap.set(owner, { owner, uiAmount });
+      }
+    });
+
+    const holders = Array.from(holdersMap.values()).sort(
+      (a, b) => b.uiAmount - a.uiAmount
+    );
+
+    return { holders, usedFallback: true };
+  }
+}
+
+// -----------------------------------------------------------------------------
+// /api/holder-info  -> top holders + concentratie
+// -----------------------------------------------------------------------------
+
+app.get("/api/holder-info", async (req: Request, res: Response) => {
+  const mint = (req.query.mint as string | undefined)?.trim();
+  const minStr = (req.query.min as string | undefined)?.trim();
+  const limitStr = (req.query.limit as string | undefined)?.trim();
+
+  if (!mint) {
+    return res.status(400).json({ error: "Missing mint query param" });
+  }
+
+  let mintKey: PublicKey;
+  try {
+    mintKey = new PublicKey(mint);
+  } catch {
+    return res.status(400).json({ error: "Invalid mint address" });
+  }
+
+  const minAmount = minStr ? parseFloat(minStr) : 0;
+  const limit = limitStr ? parseInt(limitStr, 10) : 100;
+
+  try {
+    const parsedMint = await connection.getParsedAccountInfo(
+      mintKey,
+      "confirmed"
+    );
+    if (!parsedMint.value) {
+      return res.status(404).json({
+        error: "Mint account not found",
+        mint,
+      });
+    }
+
+    const mintData = parsedMint.value.data as ParsedAccountData;
+    if (mintData.program !== "spl-token" || mintData.parsed.type !== "mint") {
+      return res.status(400).json({
+        error: "Account is not an SPL mint",
+        mint,
+      });
+    }
+
+    const mInfo: any = mintData.parsed.info;
+    const decimals: number = mInfo.decimals;
+    const supplyRaw: string = mInfo.supply;
+    const supply =
+      decimals >= 0
+        ? Number(supplyRaw) / Math.pow(10, decimals)
+        : Number(supplyRaw);
+
+    const { holders: allHolders, usedFallback } =
+      await aggregateHoldersForMint(mintKey);
+
+    let holders = allHolders;
     const totalHolders = holders.length;
 
-    // Filter op minAmount
     if (minAmount > 0) {
       holders = holders.filter((h) => h.uiAmount >= minAmount);
     }
 
     const filteredCount = holders.length;
-
-    // Top N
     const top = holders.slice(0, isNaN(limit) ? 100 : limit);
 
     function pctOfSupply(count: number): number {
@@ -599,10 +655,18 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       topCount: holdersWithPct.length,
       concentration,
       holders: holdersWithPct,
-      note:
-        "This endpoint aggregates all token accounts by owner. Percentages are approximate and based on current total supply.",
+      note: usedFallback
+        ? "RPC scan aborted for full holder list. Falling back to largest token accounts only. Percentages are approximate."
+        : "This endpoint aggregates all token accounts by owner. Percentages are approximate and based on current total supply.",
     });
   } catch (e: any) {
+    if (isScanAbortedError(e)) {
+      return res.status(400).json({
+        error: "SCAN_ABORTED",
+        message:
+          "RPC scan aborted. Try again later or with a more specific filter.",
+      });
+    }
     console.error("holder-info error:", e);
     return res.status(500).json({
       error: "Failed to fetch holder info",
@@ -612,7 +676,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/whale-tracker  -> filter grote holders op % van supply
+// /api/whale-tracker  -> whales op basis van holder-aggregatie
 // -----------------------------------------------------------------------------
 
 app.get("/api/whale-tracker", async (req: Request, res: Response) => {
@@ -631,11 +695,10 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid mint address" });
   }
 
-  const minPct = minPctStr ? parseFloat(minPctStr) : 1; // default 1%
+  const minPct = minPctStr ? parseFloat(minPctStr) : 1; // default 1% van supply
   const limit = limitStr ? parseInt(limitStr, 10) : 20;
 
   try {
-    // Mint info (decimals + supply)
     const parsedMint = await connection.getParsedAccountInfo(
       mintKey,
       "confirmed"
@@ -663,74 +726,21 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    // Alle token accounts voor deze mint via getParsedProgramAccounts
-    const tokenAccounts = await connection.getParsedProgramAccounts(
-      TOKEN_PROGRAM_ID,
-      {
-        commitment: "confirmed",
-        filters: [
-          { dataSize: 165 },
-          {
-            memcmp: {
-              offset: 0,
-              bytes: mintKey.toBase58(),
-            },
-          },
-        ],
-      }
-    );
+    const { holders: allHolders, usedFallback } =
+      await aggregateHoldersForMint(mintKey);
 
-    type HolderAgg = {
-      owner: string;
-      uiAmount: number;
-    };
-
-    const holdersMap = new Map<string, HolderAgg>();
-
-    for (const ta of tokenAccounts) {
-      const info = ta.account.data as ParsedAccountData;
-      if (info.program !== "spl-token" || info.parsed.type !== "account") {
-        continue;
-      }
-
-      const parsed: any = info.parsed.info;
-      const owner: string = parsed.owner;
-      const tokenAmount = parsed.tokenAmount;
-
-      const accDecimals: number = tokenAmount.decimals;
-      const amountRaw: string = tokenAmount.amount;
-
-      let uiAmount = 0;
-      try {
-        uiAmount = Number(amountRaw) / Math.pow(10, accDecimals);
-      } catch {
-        uiAmount = 0;
-      }
-
-      if (!uiAmount || uiAmount === 0) continue;
-
-      const prev = holdersMap.get(owner);
-      if (prev) {
-        prev.uiAmount += uiAmount;
-      } else {
-        holdersMap.set(owner, { owner, uiAmount });
-      }
-    }
-
-    // Naar array, sorteren
-    const holders = Array.from(holdersMap.values()).sort(
-      (a, b) => b.uiAmount - a.uiAmount
-    );
-    const totalHolders = holders.length;
-
-    function pctOfSupplyFor(amount: number): number {
-      if (!supply || supply <= 0) return 0;
-      return (amount / supply) * 100;
-    }
+    const whales = allHolders
+      .filter((h) => {
+        if (!supply || supply <= 0) return false;
+        const pct = (h.uiAmount / supply) * 100;
+        return pct >= minPct;
+      })
+      .sort((a, b) => b.uiAmount - a.uiAmount)
+      .slice(0, isNaN(limit) ? 20 : limit);
 
     function pctOfSupply(count: number): number {
       if (!supply || supply <= 0) return 0;
-      const slice = holders.slice(0, count);
+      const slice = allHolders.slice(0, count);
       const sum = slice.reduce((acc, h) => acc + h.uiAmount, 0);
       return (sum / supply) * 100;
     }
@@ -741,17 +751,11 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
       top10: pctOfSupply(10),
     };
 
-    // whales = holders met percentageOfSupply >= minPct
-    const whalesRaw = holders
-      .map((h) => ({
-        owner: h.owner,
-        uiAmount: h.uiAmount,
-        percentageOfSupply: pctOfSupplyFor(h.uiAmount),
-      }))
-      .filter((h) => h.percentageOfSupply >= minPct)
-      .slice(0, isNaN(limit) ? 20 : limit);
-
-    const filteredCount = whalesRaw.length;
+    const whalesWithPct = whales.map((h) => ({
+      owner: h.owner,
+      uiAmount: h.uiAmount,
+      percentageOfSupply: supply > 0 ? (h.uiAmount / supply) * 100 : 0,
+    }));
 
     return res.json({
       mint,
@@ -759,16 +763,21 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
       decimals,
       supplyRaw,
       supply,
-      totalHolders,
-      filteredCount,
-      concentration,
-      whales: whalesRaw,
       minPct,
-      limit,
-      note:
-        "Whales are holders at or above the configured percentage of total supply. Percentages are approximate and based on current total supply.",
+      concentration,
+      whales: whalesWithPct,
+      note: usedFallback
+        ? "RPC scan aborted for full holder list. Whale data is based on largest token accounts only (approximate)."
+        : "Whales are wallets holding at least minPct% of total supply, based on aggregated token accounts.",
     });
   } catch (e: any) {
+    if (isScanAbortedError(e)) {
+      return res.status(400).json({
+        error: "SCAN_ABORTED",
+        message:
+          "RPC scan aborted because this token has too many accounts. Whale-tracker works best for mid/small-cap SPL tokens.",
+      });
+    }
     console.error("whale-tracker error:", e);
     return res.status(500).json({
       error: "Failed to fetch whale tracker info",
@@ -786,3 +795,4 @@ app.listen(PORT, () => {
     `solana-tools-api listening on port ${PORT} (RPC=${RPC_URL})`
   );
 });
+
