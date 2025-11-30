@@ -342,7 +342,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
     const freezeAuthority = info.freezeAuthority ?? null;
     const isInitialized = !!info.isInitialized;
 
-    // Dex data
     const pairs = await fetchDexPairsForMint(mint);
     const raydiumPairs = pairs.filter(
       (p) => p.chainId === "solana" && p.dexId.toLowerCase() === "raydium"
@@ -451,7 +450,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/holder-info  -> top holders + concentratie
+// /api/holder-info  -> top holders + concentratie (lichtgewicht versie)
 // -----------------------------------------------------------------------------
 
 app.get("/api/holder-info", async (req: Request, res: Response) => {
@@ -471,9 +470,10 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
   }
 
   const minAmount = minStr ? parseFloat(minStr) : 0;
-  const limit = limitStr ? parseInt(limitStr, 10) : 100;
+  const limit = limitStr ? parseInt(limitStr, 10) : 50;
 
   try {
+    // 1) Mint info voor decimals + supply
     const parsedMint = await connection.getParsedAccountInfo(
       mintKey,
       "confirmed"
@@ -501,70 +501,86 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    const tokenAccounts = await connection.getParsedProgramAccounts(
-      TOKEN_PROGRAM_ID,
-      {
-        commitment: "confirmed",
-        filters: [
-          { dataSize: 165 },
-          {
-            memcmp: {
-              offset: 0,
-              bytes: mintKey.toBase58(),
-            },
-          },
-        ],
-      }
+    // 2) Vraag de grootste tokenaccounts op (de node doet de zware scan)
+    const largest = await connection.getTokenLargestAccounts(
+      mintKey,
+      "confirmed"
+    );
+    const rawList = largest.value || [];
+
+    if (rawList.length === 0) {
+      return res.json({
+        mint,
+        rpcUrl: RPC_URL,
+        decimals,
+        supplyRaw,
+        supply,
+        totalHolders: 0,
+        filteredCount: 0,
+        topCount: 0,
+        concentration: { top1: 0, top5: 0, top10: 0 },
+        holders: [],
+        note:
+          "No token accounts found for this mint. Data based on getTokenLargestAccounts.",
+      });
+    }
+
+    // 3) Owners van deze accounts ophalen met getMultipleAccountsInfo
+    //    (we beperken tot max 100 om het licht te houden)
+    const accountPubkeys = rawList
+      .slice(0, 100)
+      .map((r) => r.address);
+
+    const accountInfos = await connection.getMultipleAccountsInfo(
+      accountPubkeys,
+      "confirmed"
     );
 
-    type HolderAgg = {
+    type HolderRow = {
       owner: string;
       uiAmount: number;
+      percentageOfSupply: number;
     };
 
-    const holdersMap = new Map<string, HolderAgg>();
+    const holders: HolderRow[] = [];
 
-    for (const ta of tokenAccounts) {
-      const info = ta.account.data as ParsedAccountData;
-      if (info.program !== "spl-token" || info.parsed.type !== "account") {
-        continue;
-      }
+    accountInfos.forEach((ai, idx) => {
+      const info = ai;
+      if (!info) return;
 
-      const parsed: any = info.parsed.info;
-      const owner: string = parsed.owner;
-      const tokenAmount = parsed.tokenAmount;
+      const data = info.data;
+      if (!data || data.length < 96) return;
 
-      const accDecimals: number = tokenAmount.decimals;
-      const amountRaw: string = tokenAmount.amount;
+      // owner bytes in SPL-token account: offset 32, length 32
+      const ownerBytes = data.slice(32, 64);
+      const owner = new PublicKey(ownerBytes).toBase58();
 
-      let uiAmount = 0;
-      try {
-        uiAmount = Number(amountRaw) / Math.pow(10, accDecimals);
-      } catch {
-        uiAmount = 0;
-      }
+      const raw = rawList[idx];
+      const amountRaw = raw.amount;
 
-      if (!uiAmount || uiAmount === 0) continue;
+      const uiAmount =
+        decimals >= 0
+          ? Number(amountRaw) / Math.pow(10, decimals)
+          : Number(amountRaw);
 
-      const prev = holdersMap.get(owner);
-      if (prev) {
-        prev.uiAmount += uiAmount;
-      } else {
-        holdersMap.set(owner, { owner, uiAmount });
-      }
-    }
+      if (!uiAmount || uiAmount === 0) return;
 
-    let holders = Array.from(holdersMap.values());
+      if (minAmount > 0 && uiAmount < minAmount) return;
+
+      const pct =
+        supply > 0 ? (uiAmount / supply) * 100 : 0;
+
+      holders.push({
+        owner,
+        uiAmount,
+        percentageOfSupply: pct,
+      });
+    });
+
+    // sorteer op grootste holdings
     holders.sort((a, b) => b.uiAmount - a.uiAmount);
 
-    const totalHolders = holders.length;
-
-    if (minAmount > 0) {
-      holders = holders.filter((h) => h.uiAmount >= minAmount);
-    }
-
-    const filteredCount = holders.length;
-    const top = holders.slice(0, isNaN(limit) ? 100 : limit);
+    const top = holders.slice(0, isNaN(limit) ? 50 : limit);
 
     function pctOfSupply(count: number): number {
       if (!supply || supply <= 0) return 0;
@@ -579,25 +595,21 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       top10: pctOfSupply(10),
     };
 
-    const holdersWithPct = top.map((h) => ({
-      owner: h.owner,
-      uiAmount: h.uiAmount,
-      percentageOfSupply: supply > 0 ? (h.uiAmount / supply) * 100 : 0,
-    }));
-
     return res.json({
       mint,
       rpcUrl: RPC_URL,
       decimals,
       supplyRaw,
       supply,
-      totalHolders,
-      filteredCount,
-      topCount: holdersWithPct.length,
+      // Dit is het aantal grootste accounts dat de RPC teruggeeft,
+      // niet het echte totale aantal unieke holders.
+      totalHolders: rawList.length,
+      filteredCount: top.length,
+      topCount: top.length,
       concentration,
-      holders: holdersWithPct,
+      holders: top,
       note:
-        "This endpoint aggregates all token accounts by owner. Percentages are approximate and based on current total supply.",
+        "Top holder distribution based on getTokenLargestAccounts (largest token accounts on-chain). For very large tokens this is an approximation of total holders.",
     });
   } catch (e: any) {
     console.error("holder-info error:", e);
@@ -659,8 +671,10 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    // Helius/cluster call: grootste accounts voor deze mint
-    const largest = await connection.getTokenLargestAccounts(mintKey, "confirmed");
+    const largest = await connection.getTokenLargestAccounts(
+      mintKey,
+      "confirmed"
+    );
 
     const whalesRaw = largest.value || [];
 
@@ -686,7 +700,6 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         const info = ai;
         if (!info) return;
 
-        // raw account layout: owner op offset 32, 32 bytes
         const data = info.data;
         if (!data || data.length < 96) return;
 
@@ -694,7 +707,7 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         const owner = new PublicKey(ownerBytes).toBase58();
 
         const raw = whalesRaw[idx];
-        const amountRaw = raw.amount; // string
+        const amountRaw = raw.amount;
         const uiAmount =
           decimals >= 0
             ? Number(amountRaw) / Math.pow(10, decimals)
