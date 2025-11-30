@@ -27,6 +27,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// -----------------------------------------------------------------------------
+// Helper: RPC error-detectie
+// -----------------------------------------------------------------------------
+
 function isScanAbortedError(e: any): boolean {
   const msg = (e?.message || "").toString().toLowerCase();
   return (
@@ -41,7 +45,10 @@ function isRateLimitError(e: any): boolean {
   return (
     code === 429 ||
     msg.includes("too many requests") ||
-    msg.includes("rate limit")
+    msg.includes("rate limit") ||
+    // Helius-specifieke tekst bij grote mints (JUP, USDC, etc.)
+    msg.includes("request deprioritized due to number of accounts requested") ||
+    msg.includes("slow down requests or add filters to narrow down results")
   );
 }
 
@@ -237,7 +244,7 @@ app.get("/api/token-info", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/cbs-metrics  -> DexScreener pools & liquidity (no 500s)
+// /api/cbs-metrics  -> DexScreener pools & liquidity
 // -----------------------------------------------------------------------------
 
 app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
@@ -359,7 +366,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
     const freezeAuthority = info.freezeAuthority ?? null;
     const isInitialized = !!info.isInitialized;
 
-    // Dex data best-effort
     let pairs: DexPair[] = [];
     let raydiumPairs: DexPair[] = [];
     let totalLiquidityUsd = 0;
@@ -384,7 +390,6 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
       );
     } catch (dexErr: any) {
       console.warn("token-safety-check dex error:", dexErr?.message || dexErr);
-      // dex info optioneel
     }
 
     const reasons: string[] = [];
@@ -478,11 +483,11 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// Helper: holders via getTokenLargestAccounts ONLY (no extra RPC per account)
+// Helper: holders via getTokenLargestAccounts ONLY
 // -----------------------------------------------------------------------------
 
 type HolderAgg = {
-  owner: string;      // here: token account address
+  owner: string; // token account address
   uiAmount: number;
 };
 
@@ -496,7 +501,6 @@ async function aggregateHoldersLargestOnly(
   const holders: HolderAgg[] = values.map((v) => {
     let uiAmount = v.uiAmount;
     if (uiAmount == null) {
-      // fallback: amount / 10^decimals
       uiAmount = Number(v.amount) / Math.pow(10, v.decimals);
     }
     return {
@@ -513,7 +517,7 @@ async function aggregateHoldersLargestOnly(
 }
 
 // -----------------------------------------------------------------------------
-// /api/holder-info  -> top holders + concentratie (scales for big tokens)
+// /api/holder-info  -> top holders + concentratie
 // -----------------------------------------------------------------------------
 
 app.get("/api/holder-info", async (req: Request, res: Response) => {
@@ -566,7 +570,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
     const allHolders = await aggregateHoldersLargestOnly(mintKey);
 
     let holders = allHolders;
-    const totalHolders = holders.length; // aantal largest accounts
+    const totalHolders = holders.length;
 
     if (minAmount > 0) {
       holders = holders.filter((h) => h.uiAmount >= minAmount);
@@ -606,7 +610,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       concentration,
       holders: holdersWithPct,
       note:
-        "Based on the largest token accounts only (getTokenLargestAccounts). Each row is a token account, percentages are approximate vs total supply.",
+        "Based on the largest token accounts only (getTokenLargestAccounts). Each row is a token account; percentages are approximate vs total supply.",
     });
   } catch (e: any) {
     if (isRateLimitError(e)) {
@@ -618,7 +622,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
         holders: [],
         concentration: { top1: 0, top5: 0, top10: 0 },
         note:
-          "Rate limited by RPC for holder-info. Try again in a minute or use a smaller token.",
+          "Rate limited / deprioritized by RPC for holder-info. Try again in a minute or use a smaller token.",
       });
     }
     if (isScanAbortedError(e)) {
@@ -743,7 +747,7 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         whales: [],
         concentration: { top1: 0, top5: 0, top10: 0 },
         note:
-          "Rate limited by RPC for whale-tracker. Try again in a minute or use a smaller token.",
+          "Rate limited / deprioritized by RPC for whale-tracker. Try again in a minute or use a smaller token.",
       });
     }
     if (isScanAbortedError(e)) {
