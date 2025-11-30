@@ -35,6 +35,16 @@ function isScanAbortedError(e: any): boolean {
   );
 }
 
+function isRateLimitError(e: any): boolean {
+  const msg = (e?.message || "").toString().toLowerCase();
+  const code = e?.code;
+  return (
+    code === 429 ||
+    msg.includes("too many requests") ||
+    msg.includes("rate limit")
+  );
+}
+
 // Simple root
 app.get("/", (_req: Request, res: Response) => {
   res.json({
@@ -227,8 +237,7 @@ app.get("/api/token-info", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/cbs-metrics  -> DexScreener pools & liquidity
-// (no 500's meer: altijd nette JSON terug)
+// /api/cbs-metrics  -> DexScreener pools & liquidity (no 500s)
 // -----------------------------------------------------------------------------
 
 app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
@@ -287,7 +296,6 @@ app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
     });
   } catch (e: any) {
     console.error("cbs-metrics error:", e);
-    // geen 500, maar nette "empty" metrics
     return res.json({
       mint,
       rpcUrl: RPC_URL,
@@ -307,7 +315,6 @@ app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
 
 // -----------------------------------------------------------------------------
 // /api/token-safety-check  -> heuristische risico-analyse
-// (Dex-data is optioneel; bij error gewoon alleen on-chain)
 // -----------------------------------------------------------------------------
 
 app.get("/api/token-safety-check", async (req: Request, res: Response) => {
@@ -352,7 +359,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
     const freezeAuthority = info.freezeAuthority ?? null;
     const isInitialized = !!info.isInitialized;
 
-    // Dex data is "best effort"
+    // Dex data best-effort
     let pairs: DexPair[] = [];
     let raydiumPairs: DexPair[] = [];
     let totalLiquidityUsd = 0;
@@ -377,7 +384,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
       );
     } catch (dexErr: any) {
       console.warn("token-safety-check dex error:", dexErr?.message || dexErr);
-      // laat gewoon dex-data leeg, maar geen 500
+      // dex info optioneel
     }
 
     const reasons: string[] = [];
@@ -471,11 +478,11 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// Helper: holders via getTokenLargestAccounts ONLY (scales voor grote tokens)
+// Helper: holders via getTokenLargestAccounts ONLY (no extra RPC per account)
 // -----------------------------------------------------------------------------
 
 type HolderAgg = {
-  owner: string;
+  owner: string;      // here: token account address
   uiAmount: number;
 };
 
@@ -486,39 +493,27 @@ async function aggregateHoldersLargestOnly(
   const values = largest.value || [];
   if (!values.length) return [];
 
-  const accountPubkeys = values.map((v) => v.address);
-  const parsedInfos = await Promise.all(
-    accountPubkeys.map((pk) => connection.getParsedAccountInfo(pk, "confirmed"))
-  );
-
-  const holdersMap = new Map<string, HolderAgg>();
-
-  values.forEach((v, idx) => {
-    const infoWrapper = parsedInfos[idx];
-    const uiAmount = v.uiAmount || 0;
-    if (!uiAmount || uiAmount === 0) return;
-
-    const parsedData = infoWrapper.value?.data as ParsedAccountData | undefined;
-    if (!parsedData || parsedData.program !== "spl-token") return;
-    const parsed: any = parsedData.parsed.info;
-    const owner: string = parsed.owner;
-
-    const prev = holdersMap.get(owner);
-    if (prev) {
-      prev.uiAmount += uiAmount;
-    } else {
-      holdersMap.set(owner, { owner, uiAmount });
+  const holders: HolderAgg[] = values.map((v) => {
+    let uiAmount = v.uiAmount;
+    if (uiAmount == null) {
+      // fallback: amount / 10^decimals
+      uiAmount = Number(v.amount) / Math.pow(10, v.decimals);
     }
+    return {
+      owner:
+        typeof (v.address as any).toBase58 === "function"
+          ? (v.address as any).toBase58()
+          : String(v.address),
+      uiAmount: uiAmount || 0,
+    };
   });
 
-  const holders = Array.from(holdersMap.values()).sort(
-    (a, b) => b.uiAmount - a.uiAmount
-  );
+  holders.sort((a, b) => b.uiAmount - a.uiAmount);
   return holders;
 }
 
 // -----------------------------------------------------------------------------
-// /api/holder-info  -> top holders + concentratie (altijd schaalbaar)
+// /api/holder-info  -> top holders + concentratie (scales for big tokens)
 // -----------------------------------------------------------------------------
 
 app.get("/api/holder-info", async (req: Request, res: Response) => {
@@ -571,7 +566,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
     const allHolders = await aggregateHoldersLargestOnly(mintKey);
 
     let holders = allHolders;
-    const totalHolders = holders.length; // aantal grootste accounts uit RPC
+    const totalHolders = holders.length; // aantal largest accounts
 
     if (minAmount > 0) {
       holders = holders.filter((h) => h.uiAmount >= minAmount);
@@ -611,13 +606,29 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       concentration,
       holders: holdersWithPct,
       note:
-        "Based on the largest token accounts only (getTokenLargestAccounts). Percentages are approximate and use current total supply.",
+        "Based on the largest token accounts only (getTokenLargestAccounts). Each row is a token account, percentages are approximate vs total supply.",
     });
   } catch (e: any) {
+    if (isRateLimitError(e)) {
+      console.warn("holder-info rate limit:", e?.message || e);
+      return res.json({
+        mint,
+        rpcUrl: RPC_URL,
+        rateLimited: true,
+        holders: [],
+        concentration: { top1: 0, top5: 0, top10: 0 },
+        note:
+          "Rate limited by RPC for holder-info. Try again in a minute or use a smaller token.",
+      });
+    }
     if (isScanAbortedError(e)) {
-      return res.status(400).json({
-        error: "SCAN_ABORTED",
-        message:
+      return res.json({
+        mint,
+        rpcUrl: RPC_URL,
+        scanAborted: true,
+        holders: [],
+        concentration: { top1: 0, top5: 0, top10: 0 },
+        note:
           "RPC scan aborted. This should be rare with getTokenLargestAccounts; try again later.",
       });
     }
@@ -630,7 +641,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/whale-tracker  -> whales t.o.v. supply (ook via largest accounts)
+// /api/whale-tracker  -> whales t.o.v. supply (largest accounts)
 // -----------------------------------------------------------------------------
 
 app.get("/api/whale-tracker", async (req: Request, res: Response) => {
@@ -720,13 +731,29 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
       concentration,
       whales: whalesWithPct,
       note:
-        "Whales are based on the largest token accounts (getTokenLargestAccounts). Percentages use current total supply and are approximate.",
+        "Whales are derived from the largest token accounts (token accounts as 'owners'). Percentages are vs total supply and approximate.",
     });
   } catch (e: any) {
+    if (isRateLimitError(e)) {
+      console.warn("whale-tracker rate limit:", e?.message || e);
+      return res.json({
+        mint,
+        rpcUrl: RPC_URL,
+        rateLimited: true,
+        whales: [],
+        concentration: { top1: 0, top5: 0, top10: 0 },
+        note:
+          "Rate limited by RPC for whale-tracker. Try again in a minute or use a smaller token.",
+      });
+    }
     if (isScanAbortedError(e)) {
-      return res.status(400).json({
-        error: "SCAN_ABORTED",
-        message:
+      return res.json({
+        mint,
+        rpcUrl: RPC_URL,
+        scanAborted: true,
+        whales: [],
+        concentration: { top1: 0, top5: 0, top10: 0 },
+        note:
           "RPC scan aborted. This should be rare with getTokenLargestAccounts; try again later.",
       });
     }
