@@ -41,6 +41,7 @@ app.get("/", (_req: Request, res: Response) => {
       "/api/cbs-metrics?mint=...",
       "/api/token-safety-check?mint=...",
       "/api/holder-info?mint=...",
+      "/api/whale-tracker?mint=...&minPct=1&limit=20",
     ],
   });
 });
@@ -605,6 +606,172 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
     console.error("holder-info error:", e);
     return res.status(500).json({
       error: "Failed to fetch holder info",
+      message: e?.message || String(e),
+    });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// /api/whale-tracker  -> filter grote holders op % van supply
+// -----------------------------------------------------------------------------
+
+app.get("/api/whale-tracker", async (req: Request, res: Response) => {
+  const mint = (req.query.mint as string | undefined)?.trim();
+  const minPctStr = (req.query.minPct as string | undefined)?.trim();
+  const limitStr = (req.query.limit as string | undefined)?.trim();
+
+  if (!mint) {
+    return res.status(400).json({ error: "Missing mint query param" });
+  }
+
+  let mintKey: PublicKey;
+  try {
+    mintKey = new PublicKey(mint);
+  } catch {
+    return res.status(400).json({ error: "Invalid mint address" });
+  }
+
+  const minPct = minPctStr ? parseFloat(minPctStr) : 1; // default 1%
+  const limit = limitStr ? parseInt(limitStr, 10) : 20;
+
+  try {
+    // Mint info (decimals + supply)
+    const parsedMint = await connection.getParsedAccountInfo(
+      mintKey,
+      "confirmed"
+    );
+    if (!parsedMint.value) {
+      return res.status(404).json({
+        error: "Mint account not found",
+        mint,
+      });
+    }
+
+    const mintData = parsedMint.value.data as ParsedAccountData;
+    if (mintData.program !== "spl-token" || mintData.parsed.type !== "mint") {
+      return res.status(400).json({
+        error: "Account is not an SPL mint",
+        mint,
+      });
+    }
+
+    const mInfo: any = mintData.parsed.info;
+    const decimals: number = mInfo.decimals;
+    const supplyRaw: string = mInfo.supply;
+    const supply =
+      decimals >= 0
+        ? Number(supplyRaw) / Math.pow(10, decimals)
+        : Number(supplyRaw);
+
+    // Alle token accounts voor deze mint via getParsedProgramAccounts
+    const tokenAccounts = await connection.getParsedProgramAccounts(
+      TOKEN_PROGRAM_ID,
+      {
+        commitment: "confirmed",
+        filters: [
+          { dataSize: 165 },
+          {
+            memcmp: {
+              offset: 0,
+              bytes: mintKey.toBase58(),
+            },
+          },
+        ],
+      }
+    );
+
+    type HolderAgg = {
+      owner: string;
+      uiAmount: number;
+    };
+
+    const holdersMap = new Map<string, HolderAgg>();
+
+    for (const ta of tokenAccounts) {
+      const info = ta.account.data as ParsedAccountData;
+      if (info.program !== "spl-token" || info.parsed.type !== "account") {
+        continue;
+      }
+
+      const parsed: any = info.parsed.info;
+      const owner: string = parsed.owner;
+      const tokenAmount = parsed.tokenAmount;
+
+      const accDecimals: number = tokenAmount.decimals;
+      const amountRaw: string = tokenAmount.amount;
+
+      let uiAmount = 0;
+      try {
+        uiAmount = Number(amountRaw) / Math.pow(10, accDecimals);
+      } catch {
+        uiAmount = 0;
+      }
+
+      if (!uiAmount || uiAmount === 0) continue;
+
+      const prev = holdersMap.get(owner);
+      if (prev) {
+        prev.uiAmount += uiAmount;
+      } else {
+        holdersMap.set(owner, { owner, uiAmount });
+      }
+    }
+
+    // Naar array, sorteren
+    const holders = Array.from(holdersMap.values()).sort(
+      (a, b) => b.uiAmount - a.uiAmount
+    );
+    const totalHolders = holders.length;
+
+    function pctOfSupplyFor(amount: number): number {
+      if (!supply || supply <= 0) return 0;
+      return (amount / supply) * 100;
+    }
+
+    function pctOfSupply(count: number): number {
+      if (!supply || supply <= 0) return 0;
+      const slice = holders.slice(0, count);
+      const sum = slice.reduce((acc, h) => acc + h.uiAmount, 0);
+      return (sum / supply) * 100;
+    }
+
+    const concentration = {
+      top1: pctOfSupply(1),
+      top5: pctOfSupply(5),
+      top10: pctOfSupply(10),
+    };
+
+    // whales = holders met percentageOfSupply >= minPct
+    const whalesRaw = holders
+      .map((h) => ({
+        owner: h.owner,
+        uiAmount: h.uiAmount,
+        percentageOfSupply: pctOfSupplyFor(h.uiAmount),
+      }))
+      .filter((h) => h.percentageOfSupply >= minPct)
+      .slice(0, isNaN(limit) ? 20 : limit);
+
+    const filteredCount = whalesRaw.length;
+
+    return res.json({
+      mint,
+      rpcUrl: RPC_URL,
+      decimals,
+      supplyRaw,
+      supply,
+      totalHolders,
+      filteredCount,
+      concentration,
+      whales: whalesRaw,
+      minPct,
+      limit,
+      note:
+        "Whales are holders at or above the configured percentage of total supply. Percentages are approximate and based on current total supply.",
+    });
+  } catch (e: any) {
+    console.error("whale-tracker error:", e);
+    return res.status(500).json({
+      error: "Failed to fetch whale tracker info",
       message: e?.message || String(e),
     });
   }
