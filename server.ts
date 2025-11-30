@@ -228,6 +228,7 @@ app.get("/api/token-info", async (req: Request, res: Response) => {
 
 // -----------------------------------------------------------------------------
 // /api/cbs-metrics  -> DexScreener pools & liquidity
+// (no 500's meer: altijd nette JSON terug)
 // -----------------------------------------------------------------------------
 
 app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
@@ -265,6 +266,7 @@ app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
     return res.json({
       mint,
       rpcUrl: RPC_URL,
+      ok: true,
       totalPools: pairs.length,
       raydiumCount: raydiumPairs.length,
       otherDexCount: pairs.length - raydiumPairs.length,
@@ -285,15 +287,27 @@ app.get("/api/cbs-metrics", async (req: Request, res: Response) => {
     });
   } catch (e: any) {
     console.error("cbs-metrics error:", e);
-    return res.status(500).json({
-      error: "Failed to fetch Dex metrics",
-      message: e?.message || String(e),
+    // geen 500, maar nette "empty" metrics
+    return res.json({
+      mint,
+      rpcUrl: RPC_URL,
+      ok: false,
+      totalPools: 0,
+      raydiumCount: 0,
+      otherDexCount: 0,
+      totalLiquidityUsd: 0,
+      raydium: [],
+      others: [],
+      note:
+        e?.message ||
+        "Failed to fetch Dex metrics (DexScreener error or network issue).",
     });
   }
 });
 
 // -----------------------------------------------------------------------------
 // /api/token-safety-check  -> heuristische risico-analyse
+// (Dex-data is optioneel; bij error gewoon alleen on-chain)
 // -----------------------------------------------------------------------------
 
 app.get("/api/token-safety-check", async (req: Request, res: Response) => {
@@ -338,22 +352,33 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
     const freezeAuthority = info.freezeAuthority ?? null;
     const isInitialized = !!info.isInitialized;
 
-    const pairs = await fetchDexPairsForMint(mint);
-    const raydiumPairs = pairs.filter(
-      (p) => p.chainId === "solana" && p.dexId.toLowerCase() === "raydium"
-    );
-    const totalLiquidityUsd = raydiumPairs.reduce(
-      (acc, p) => acc + (p.liquidity?.usd || 0),
-      0
-    );
-    const largestPool = raydiumPairs.reduce<DexPair | null>(
-      (acc, p) => {
-        const liq = p.liquidity?.usd || 0;
-        if (!acc) return p;
-        return liq > (acc.liquidity?.usd || 0) ? p : acc;
-      },
-      null
-    );
+    // Dex data is "best effort"
+    let pairs: DexPair[] = [];
+    let raydiumPairs: DexPair[] = [];
+    let totalLiquidityUsd = 0;
+    let largestPool: DexPair | null = null;
+
+    try {
+      pairs = await fetchDexPairsForMint(mint);
+      raydiumPairs = pairs.filter(
+        (p) => p.chainId === "solana" && p.dexId.toLowerCase() === "raydium"
+      );
+      totalLiquidityUsd = raydiumPairs.reduce(
+        (acc, p) => acc + (p.liquidity?.usd || 0),
+        0
+      );
+      largestPool = raydiumPairs.reduce<DexPair | null>(
+        (acc, p) => {
+          const liq = p.liquidity?.usd || 0;
+          if (!acc) return p;
+          return liq > (acc.liquidity?.usd || 0) ? p : acc;
+        },
+        null
+      );
+    } catch (dexErr: any) {
+      console.warn("token-safety-check dex error:", dexErr?.message || dexErr);
+      // laat gewoon dex-data leeg, maar geen 500
+    }
 
     const reasons: string[] = [];
     const immutableMint = mintAuthority === null;
@@ -379,7 +404,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
         )}.`
       );
     } else {
-      reasons.push("No Raydium pools found on DexScreener.");
+      reasons.push("No Raydium pools found on DexScreener or request failed.");
     }
 
     let riskLevel: "low" | "medium" | "high" = "medium";
@@ -434,7 +459,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
         reasons,
       },
       disclaimer:
-        "This is a heuristic safety check based on on-chain metadata and DexScreener data. It is NOT financial advice. Always do your own research.",
+        "This is a heuristic safety check based on on-chain metadata and (if available) DexScreener data. It is NOT financial advice. Always do your own research.",
     });
   } catch (e: any) {
     console.error("token-safety-check error:", e);
@@ -446,7 +471,7 @@ app.get("/api/token-safety-check", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// Helper: aggregate holders by owner (full scan + fallback top accounts)
+// Helper: holders via getTokenLargestAccounts ONLY (scales voor grote tokens)
 // -----------------------------------------------------------------------------
 
 type HolderAgg = {
@@ -454,115 +479,46 @@ type HolderAgg = {
   uiAmount: number;
 };
 
-async function aggregateHoldersForMint(
+async function aggregateHoldersLargestOnly(
   mintKey: PublicKey
-): Promise<{
-  holders: HolderAgg[];
-  usedFallback: boolean;
-}> {
-  // 1) probeer volledige scan
-  try {
-    const tokenAccounts = await connection.getParsedProgramAccounts(
-      TOKEN_PROGRAM_ID,
-      {
-        commitment: "confirmed",
-        filters: [
-          { dataSize: 165 },
-          {
-            memcmp: {
-              offset: 0,
-              bytes: mintKey.toBase58(),
-            },
-          },
-        ],
-      }
-    );
+): Promise<HolderAgg[]> {
+  const largest = await connection.getTokenLargestAccounts(mintKey, "confirmed");
+  const values = largest.value || [];
+  if (!values.length) return [];
 
-    const holdersMap = new Map<string, HolderAgg>();
+  const accountPubkeys = values.map((v) => v.address);
+  const parsedInfos = await Promise.all(
+    accountPubkeys.map((pk) => connection.getParsedAccountInfo(pk, "confirmed"))
+  );
 
-    for (const ta of tokenAccounts) {
-      const info = ta.account.data as ParsedAccountData;
-      if (info.program !== "spl-token" || info.parsed.type !== "account") {
-        continue;
-      }
+  const holdersMap = new Map<string, HolderAgg>();
 
-      const parsed: any = info.parsed.info;
-      const owner: string = parsed.owner;
-      const tokenAmount = parsed.tokenAmount;
+  values.forEach((v, idx) => {
+    const infoWrapper = parsedInfos[idx];
+    const uiAmount = v.uiAmount || 0;
+    if (!uiAmount || uiAmount === 0) return;
 
-      const accDecimals: number = tokenAmount.decimals;
-      const amountRaw: string = tokenAmount.amount;
+    const parsedData = infoWrapper.value?.data as ParsedAccountData | undefined;
+    if (!parsedData || parsedData.program !== "spl-token") return;
+    const parsed: any = parsedData.parsed.info;
+    const owner: string = parsed.owner;
 
-      let uiAmount = 0;
-      try {
-        uiAmount = Number(amountRaw) / Math.pow(10, accDecimals);
-      } catch {
-        uiAmount = 0;
-      }
-
-      if (!uiAmount || uiAmount === 0) continue;
-
-      const prev = holdersMap.get(owner);
-      if (prev) {
-        prev.uiAmount += uiAmount;
-      } else {
-        holdersMap.set(owner, { owner, uiAmount });
-      }
+    const prev = holdersMap.get(owner);
+    if (prev) {
+      prev.uiAmount += uiAmount;
+    } else {
+      holdersMap.set(owner, { owner, uiAmount });
     }
+  });
 
-    const holders = Array.from(holdersMap.values()).sort(
-      (a, b) => b.uiAmount - a.uiAmount
-    );
-
-    return { holders, usedFallback: false };
-  } catch (e: any) {
-    if (!isScanAbortedError(e)) {
-      throw e;
-    }
-
-    // 2) fallback: top token accounts via getTokenLargestAccounts
-    const largest = await connection.getTokenLargestAccounts(mintKey, "confirmed");
-    const values = largest.value || [];
-
-    if (!values.length) {
-      return { holders: [], usedFallback: true };
-    }
-
-    const accountPubkeys = values.map((v) => v.address);
-    const parsedInfos = await Promise.all(
-      accountPubkeys.map((pk) => connection.getParsedAccountInfo(pk, "confirmed"))
-    );
-
-    const holdersMap = new Map<string, HolderAgg>();
-
-    values.forEach((v, idx) => {
-      const infoWrapper = parsedInfos[idx];
-      const uiAmount = v.uiAmount || 0;
-      if (!uiAmount || uiAmount === 0) return;
-
-      const parsedData = infoWrapper.value?.data as ParsedAccountData | undefined;
-      if (!parsedData || parsedData.program !== "spl-token") return;
-      const parsed: any = parsedData.parsed.info;
-      const owner: string = parsed.owner;
-
-      const prev = holdersMap.get(owner);
-      if (prev) {
-        prev.uiAmount += uiAmount;
-      } else {
-        holdersMap.set(owner, { owner, uiAmount });
-      }
-    });
-
-    const holders = Array.from(holdersMap.values()).sort(
-      (a, b) => b.uiAmount - a.uiAmount
-    );
-
-    return { holders, usedFallback: true };
-  }
+  const holders = Array.from(holdersMap.values()).sort(
+    (a, b) => b.uiAmount - a.uiAmount
+  );
+  return holders;
 }
 
 // -----------------------------------------------------------------------------
-// /api/holder-info  -> top holders + concentratie
+// /api/holder-info  -> top holders + concentratie (altijd schaalbaar)
 // -----------------------------------------------------------------------------
 
 app.get("/api/holder-info", async (req: Request, res: Response) => {
@@ -612,11 +568,10 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    const { holders: allHolders, usedFallback } =
-      await aggregateHoldersForMint(mintKey);
+    const allHolders = await aggregateHoldersLargestOnly(mintKey);
 
     let holders = allHolders;
-    const totalHolders = holders.length;
+    const totalHolders = holders.length; // aantal grootste accounts uit RPC
 
     if (minAmount > 0) {
       holders = holders.filter((h) => h.uiAmount >= minAmount);
@@ -655,16 +610,15 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
       topCount: holdersWithPct.length,
       concentration,
       holders: holdersWithPct,
-      note: usedFallback
-        ? "RPC scan aborted for full holder list. Falling back to largest token accounts only. Percentages are approximate."
-        : "This endpoint aggregates all token accounts by owner. Percentages are approximate and based on current total supply.",
+      note:
+        "Based on the largest token accounts only (getTokenLargestAccounts). Percentages are approximate and use current total supply.",
     });
   } catch (e: any) {
     if (isScanAbortedError(e)) {
       return res.status(400).json({
         error: "SCAN_ABORTED",
         message:
-          "RPC scan aborted. Try again later or with a more specific filter.",
+          "RPC scan aborted. This should be rare with getTokenLargestAccounts; try again later.",
       });
     }
     console.error("holder-info error:", e);
@@ -676,7 +630,7 @@ app.get("/api/holder-info", async (req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// /api/whale-tracker  -> whales op basis van holder-aggregatie
+// /api/whale-tracker  -> whales t.o.v. supply (ook via largest accounts)
 // -----------------------------------------------------------------------------
 
 app.get("/api/whale-tracker", async (req: Request, res: Response) => {
@@ -695,7 +649,7 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid mint address" });
   }
 
-  const minPct = minPctStr ? parseFloat(minPctStr) : 1; // default 1% van supply
+  const minPct = minPctStr ? parseFloat(minPctStr) : 1; // default 1%
   const limit = limitStr ? parseInt(limitStr, 10) : 20;
 
   try {
@@ -726,8 +680,7 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
         ? Number(supplyRaw) / Math.pow(10, decimals)
         : Number(supplyRaw);
 
-    const { holders: allHolders, usedFallback } =
-      await aggregateHoldersForMint(mintKey);
+    const allHolders = await aggregateHoldersLargestOnly(mintKey);
 
     const whales = allHolders
       .filter((h) => {
@@ -766,16 +719,15 @@ app.get("/api/whale-tracker", async (req: Request, res: Response) => {
       minPct,
       concentration,
       whales: whalesWithPct,
-      note: usedFallback
-        ? "RPC scan aborted for full holder list. Whale data is based on largest token accounts only (approximate)."
-        : "Whales are wallets holding at least minPct% of total supply, based on aggregated token accounts.",
+      note:
+        "Whales are based on the largest token accounts (getTokenLargestAccounts). Percentages use current total supply and are approximate.",
     });
   } catch (e: any) {
     if (isScanAbortedError(e)) {
       return res.status(400).json({
         error: "SCAN_ABORTED",
         message:
-          "RPC scan aborted because this token has too many accounts. Whale-tracker works best for mid/small-cap SPL tokens.",
+          "RPC scan aborted. This should be rare with getTokenLargestAccounts; try again later.",
       });
     }
     console.error("whale-tracker error:", e);
@@ -795,4 +747,3 @@ app.listen(PORT, () => {
     `solana-tools-api listening on port ${PORT} (RPC=${RPC_URL})`
   );
 });
-
